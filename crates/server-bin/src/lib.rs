@@ -1,4 +1,4 @@
-use agentd::NaiveDetector;
+use agentd::GridDetector;
 use pty::PtyHandle;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
@@ -35,7 +35,7 @@ pub fn run(socket_path: &str) -> Result<(), ServerError> {
     let pty_to_sock = std::thread::spawn(move || {
         let mut reader = pty_reader;
         let mut writer = stream_writer;
-        let mut detector = NaiveDetector::new();
+        let mut detector = GridDetector::new(80, 24);
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {

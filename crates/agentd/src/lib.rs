@@ -1,4 +1,5 @@
 use thiserror::Error;
+use vt::Terminal;
 
 #[derive(Error, Debug)]
 pub enum AgentdError {
@@ -6,8 +7,8 @@ pub enum AgentdError {
     Io(#[from] std::io::Error),
 }
 
-/// The four states a pane can be in, as defined in
-/// `docs/04-CLIENT-SERVER-AND-AGENT-PROTOCOL.md` § 7.1.
+/// The four states a pane can be in.
+/// See `docs/04-CLIENT-SERVER-AND-AGENT-PROTOCOL.md` § 7.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneState {
     /// Shell prompt is showing; nothing is running.
@@ -20,42 +21,28 @@ pub enum PaneState {
     Done,
 }
 
-/// Phase 1 naive detector — operates on the raw PTY byte stream.
+/// Phase 2 detector — operates on the parsed grid from `crates/vt`.
 ///
-/// This is intentionally simple and will misclassify in many real cases.
-/// Phase 2 rewrites this to operate on the parsed grid/line model from
-/// `crates/vt` rather than raw bytes.
-pub struct NaiveDetector {
-    /// `None` until the first byte is fed; guarantees the first feed always emits a state.
+/// This is more reliable than the Phase 1 raw-bytes heuristic because it
+/// reads character content from the parsed grid rather than trying to
+/// strip ANSI codes manually from a rolling byte window.
+pub struct GridDetector {
+    terminal: Terminal,
     state: Option<PaneState>,
-    /// Rolling window of recent bytes for heuristic matching.
-    buf: Vec<u8>,
 }
 
-impl Default for NaiveDetector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NaiveDetector {
-    pub fn new() -> Self {
+impl GridDetector {
+    pub fn new(cols: u16, rows: u16) -> Self {
         Self {
+            terminal: Terminal::new(rows as usize, cols as usize),
             state: None,
-            buf: Vec::with_capacity(512),
         }
     }
 
-    /// Feed bytes from the PTY output stream.
-    ///
-    /// Returns the new `PaneState` if it changed (or if this is the first feed), or `None` if unchanged.
+    /// Feed raw PTY bytes. Returns the new `PaneState` if it changed
+    /// (or if this is the first feed), or `None` if unchanged.
     pub fn feed(&mut self, bytes: &[u8]) -> Option<PaneState> {
-        self.buf.extend_from_slice(bytes);
-        // Bound memory: keep only the last 512 bytes.
-        if self.buf.len() > 512 {
-            let excess = self.buf.len() - 512;
-            self.buf.drain(..excess);
-        }
+        self.terminal.advance(bytes);
         let new_state = self.classify();
         if self.state.as_ref() != Some(&new_state) {
             self.state = Some(new_state.clone());
@@ -69,25 +56,19 @@ impl NaiveDetector {
         self.state.as_ref()
     }
 
-    /// Classify current buffer contents as Idle or Working.
-    ///
-    /// Heuristic: strip ANSI escapes, then look for a common shell prompt
-    /// suffix on the last non-empty line. Works for default zsh/bash prompts.
-    /// Blocked and Done are not detectable from raw bytes; those come in Phase 2.
-    fn classify(&self) -> PaneState {
-        let text = String::from_utf8_lossy(&self.buf);
-        let stripped = strip_ansi_escapes(&text);
-        let last = stripped
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .next_back()
-            .unwrap_or("");
+    /// Access the underlying Terminal for debug dumps or further inspection.
+    pub fn terminal(&self) -> &Terminal {
+        &self.terminal
+    }
 
-        if last.ends_with("$ ")
-            || last.ends_with("% ")
-            || last.ends_with("# ")
-            || last.ends_with("> ")
-        {
+    /// Classify the current grid contents as Idle or Working.
+    ///
+    /// Reads the last non-blank line from the parsed grid and checks for
+    /// common shell prompt suffixes. Blocked/Done still require process-level
+    /// information not available in Phase 2 — those remain future work.
+    fn classify(&self) -> PaneState {
+        let last = self.terminal.last_line_text();
+        if is_shell_prompt(&last) {
             PaneState::Idle
         } else {
             PaneState::Working
@@ -95,66 +76,69 @@ impl NaiveDetector {
     }
 }
 
-/// Remove ANSI CSI escape sequences so prompt-suffix matching is not confused
-/// by color codes. Phase 1 naive implementation — sufficient for the stub.
-fn strip_ansi_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next(); // consume '['
-            // Consume parameter/intermediate bytes until the final byte (a letter).
-            for c2 in chars.by_ref() {
-                if c2.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+/// Return true if the line looks like a shell prompt.
+///
+/// Checks for the conventional suffix characters used by zsh, bash, fish,
+/// and other common shells. This intentionally matches a narrow set to avoid
+/// false positives from command output that happens to end with '> '.
+fn is_shell_prompt(line: &str) -> bool {
+    // Common prompt endings: "$ ", "% ", "# ", "> "
+    // Also accept them at the very end of the string without a trailing space
+    // (some shells don't emit the trailing space until after the cursor).
+    line.ends_with("$ ")
+        || line.ends_with("% ")
+        || line.ends_with("# ")
+        || line.ends_with("> ")
+        || line.trim_end().ends_with('$')
+        || line.trim_end().ends_with('%')
+        || line.trim_end().ends_with('#')
+        || line.trim_end().ends_with('>')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn idle_on_zsh_prompt() {
-        let mut d = NaiveDetector::new();
-        let result = d.feed(b"some output\n~/termy % ");
-        assert_eq!(result, Some(PaneState::Idle));
+    fn detect(input: &[u8]) -> Option<PaneState> {
+        let mut d = GridDetector::new(80, 24);
+        d.feed(input)
     }
 
     #[test]
-    fn working_on_mid_command_output() {
-        let mut d = NaiveDetector::new();
-        d.feed(b"~/termy % "); // prime to Idle
-        let result = d.feed(b"running something\nmore output here");
-        assert_eq!(result, Some(PaneState::Working));
+    fn idle_on_zsh_prompt() {
+        assert_eq!(detect(b"some output\r\n~/termy % "), Some(PaneState::Idle));
     }
 
     #[test]
     fn idle_on_bash_prompt() {
-        let mut d = NaiveDetector::new();
-        let result = d.feed(b"user@host:~$ ");
-        assert_eq!(result, Some(PaneState::Idle));
+        assert_eq!(detect(b"user@host:~$ "), Some(PaneState::Idle));
+    }
+
+    #[test]
+    fn idle_with_ansi_color_codes() {
+        // Shell prompt wrapped in SGR color codes — the grid strips these.
+        assert_eq!(detect(b"\x1b[32muser@host\x1b[0m:~$ "), Some(PaneState::Idle));
+    }
+
+    #[test]
+    fn working_on_mid_command_output() {
+        let mut d = GridDetector::new(80, 24);
+        d.feed(b"~/termy % "); // prime to Idle
+        let result = d.feed(b"running something\r\nmore output here");
+        assert_eq!(result, Some(PaneState::Working));
     }
 
     #[test]
     fn no_change_returns_none() {
-        let mut d = NaiveDetector::new();
-        d.feed(b"line one\nline two"); // starts Working
-        let result = d.feed(b"line three\nline four"); // still Working
+        let mut d = GridDetector::new(80, 24);
+        d.feed(b"line one\r\nline two"); // Working
+        let result = d.feed(b"line three\r\nline four"); // still Working
         assert_eq!(result, None);
     }
 
     #[test]
-    fn ansi_codes_dont_confuse_idle_detection() {
-        let mut d = NaiveDetector::new();
-        // Prompt wrapped in ANSI color codes
-        let result = d.feed(b"\x1b[32muser@host\x1b[0m:~$ ");
-        assert_eq!(result, Some(PaneState::Idle));
+    fn fish_prompt() {
+        // fish shell uses '> ' as default prompt suffix
+        assert_eq!(detect(b"~/termy> "), Some(PaneState::Idle));
     }
 }
