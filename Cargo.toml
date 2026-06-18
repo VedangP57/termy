@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pty",
+    "crates/agentd",
+    "crates/server-bin",
+    "crates/client-bin",
+    "crates/vt",
+    "crates/render",
+    "crates/fonts",
+    "crates/protocol",
+]
+
+[workspace.dependencies]
+thiserror    = "2"
+portable-pty = "0.8"

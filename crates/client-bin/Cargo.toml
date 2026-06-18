@@ -1,0 +1,15 @@
+[package]
+# Package name is "termd" so `cargo run -p termd` and `cargo tree -p termd` work.
+# Directory is client-bin to match the workspace layout in docs/02-TECH-STACK.md.
+name    = "termd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "termd"
+path = "src/main.rs"
+
+[dependencies]
+pty        = { path = "../pty" }
+server-bin = { path = "../server-bin" }
+thiserror  = { workspace = true }

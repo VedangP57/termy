@@ -1,0 +1,5 @@
+[package]
+name    = "fonts"
+version = "0.1.0"
+edition = "2021"
+# Phase 4: fontconfig (Linux) + rustybuzz. Client-only.

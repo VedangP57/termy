@@ -1,0 +1,12 @@
+[package]
+name    = "server-bin"
+version = "0.1.0"
+edition = "2021"
+
+# server-bin is a library crate — see QUESTIONS.md Q2 for the rationale.
+# It must never depend on render or fonts (GPU/windowing are client-only).
+
+[dependencies]
+pty       = { path = "../pty" }
+agentd    = { path = "../agentd" }
+thiserror = { workspace = true }

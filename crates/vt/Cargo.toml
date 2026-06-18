@@ -1,0 +1,6 @@
+[package]
+name    = "vt"
+version = "0.1.0"
+edition = "2021"
+# Phase 2: VT/ANSI parser + grid/scrollback.
+# termwiz/wezterm-term are reference only — never add them as dependencies here.
