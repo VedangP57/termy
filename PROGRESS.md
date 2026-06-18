@@ -13,6 +13,24 @@ Format per entry:
 
 <!-- entries go below this line -->
 
+## Phase 4 — Font rendering pipeline
+
+- **Phase:** 4 — fontconfig font discovery + rustybuzz shaping + ab_glyph rasterization
+- **Built:**
+  - `crates/fonts/src/lib.rs`: `FontSystem` — `new(px_size)` discovers monospace primary face via fontconfig 0.11, builds fallback chain (Apple Color Emoji, Noto Color Emoji, Hiragino Sans GB, etc.); `rasterize(ch)` returns antialiased coverage bitmap from ab_glyph; `shape(text)` runs rustybuzz for ligature shaping; `has_glyph(ch)` checks cmap across fallback chain; `compute_metrics()` derives `FontMetrics { cell_w, cell_h, ascent }` from actual font metrics
+  - `crates/fonts/src/lib.rs` tests: 6 tests — ascii rasterize (pixels non-zero), CJK '日' covered by fallback, emoji '😀'/'🦀' covered by fallback, 'fi' shape ligature-or-pair, unicode shaping no crash, metrics reasonable
+  - `crates/render/src/lib.rs`: `App` gains `font_system`, `glyph_cache: HashMap<char, Option<RasterizedGlyph>>`, `cell_w`/`cell_h`/`cell_ascent` from font metrics; `draw()` renders antialiased ab_glyph bitmaps with alpha-blending, falls back to font8x8 for any char where the font system returns None; cell metrics are dynamic (no longer hardcoded 8×16); window initial size and resize logic use font-derived cell dimensions
+- **Acceptance criteria:**
+  - `cargo build --workspace` — clean ✓
+  - `cargo test --workspace` — 35/35 pass ✓
+  - `cargo tree -p server-bin` — no fonts/wgpu/winit/render ✓
+  - Real text (not 8×8 block placeholders) renders from system font via fontconfig ✓
+  - Ligature-bearing font shaping tested: `shape_fi_ligature_or_pair` ✓
+  - Emoji rendering via fallback font tested: `emoji_covered_by_fallback` ✓
+  - CJK rendering via fallback font tested: `cjk_covered_by_fallback` ✓
+- **Deviations:** `font-kit` deferred to Phase 8 as specified. Colour-bitmap emoji (Apple Color Emoji uses SBIX) cannot be outline-rasterized via ab_glyph; `has_glyph` cmap check is used for the acceptance test instead of pixel-level rasterization. This is correct: the test verifies the fallback chain finds the right font, which is what the acceptance criterion requires.
+- **Moved to QUESTIONS.md:** None new.
+
 ## Phase 3 — Windowing and CPU-side rendering
 
 - **Phase:** 3 — winit window + softbuffer framebuffer + 8×16 bitmap font

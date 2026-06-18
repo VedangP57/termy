@@ -8,5 +8,6 @@ edition = "2021"
 winit      = "0.30"
 softbuffer = "0.4"
 font8x8    = { version = "0.2", default-features = false }
+fonts      = { path = "../fonts" }
 vt         = { path = "../vt" }
 thiserror  = { workspace = true }
