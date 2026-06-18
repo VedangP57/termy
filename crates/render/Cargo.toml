@@ -2,4 +2,11 @@
 name    = "render"
 version = "0.1.0"
 edition = "2021"
-# Phase 3+: winit + wgpu renderer. Client-only — must never appear in server-bin deps.
+# Client-only — must never appear in server-bin's dependency tree.
+
+[dependencies]
+winit      = "0.30"
+softbuffer = "0.4"
+font8x8    = { version = "0.2", default-features = false }
+vt         = { path = "../vt" }
+thiserror  = { workspace = true }

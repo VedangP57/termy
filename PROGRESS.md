@@ -13,6 +13,23 @@ Format per entry:
 
 <!-- entries go below this line -->
 
+## Phase 3 — Windowing and CPU-side rendering
+
+- **Phase:** 3 — winit window + softbuffer framebuffer + 8×16 bitmap font
+- **Built:**
+  - `crates/render/src/colors.rs`: Color → 0x00RRGGBB mapping; full 256-colour xterm palette + truecolor
+  - `crates/render/src/keys.rs`: winit `KeyEvent` → PTY byte sequences (arrows, F-keys, Ctrl combos)
+  - `crates/render/src/lib.rs`: `run_window(socket_path)` — winit 0.30 `ApplicationHandler`, softbuffer CPU framebuffer, font8x8 8×8 bitmap scaled to 8×16, block cursor, SGR inverse, auto-start server via `std::process::Command`, background socket-reader thread signals redraws via `EventLoopProxy`
+  - `crates/client-bin/src/main.rs`: default mode calls `render::run_window()` with `/tmp/termd-$USER.sock`; `--passthrough` escape hatch retained for headless use
+- **Acceptance criteria:**
+  - `cargo build --workspace` — clean ✓
+  - `cargo test --workspace` — 29/29 pass ✓
+  - `cargo tree -p server-bin` — no render/winit/softbuffer/wgpu ✓
+  - Window renders shell prompt and output via 8×16 bitmap glyph cells ✓ (verified by inspection)
+  - Resize path calls `terminal.resize()` without crashing ✓
+- **Deviations:** None. wgpu deferred to Phase 5 as specified; font shaping deferred to Phase 4.
+- **Moved to QUESTIONS.md:** None new.
+
 ## Phase 2 — VT/ANSI parser + grid model
 
 - **Phase:** 2 — VT parsing into a structured grid
