@@ -13,6 +13,24 @@ Format per entry:
 
 <!-- entries go below this line -->
 
+## Phase 5 — GPU rendering and glyph atlas
+
+- **Phase:** 5 — wgpu 29 GPU renderer with glyph atlas and damage tracking
+- **Built:**
+  - `crates/render/src/gpu/damage.rs`: `DamageTracker` — diffs terminal grid against previous frame snapshot, returns bool (any cell changed), exposes per-cell `dirty` flags and `rendered`/`skipped` frame counters; `reset()` forces full redraw on resize or surface loss
+  - `crates/render/src/gpu/atlas.rs`: `GlyphAtlas` — 1024×1024 `R8Unorm` GPU texture, shelf packer, `get_or_insert(ch, rg, queue)` uploads glyph bitmap once and returns `AtlasEntry { uv, bearing_x, bearing_y, advance_x, width, height }`
+  - `crates/render/src/gpu/mod.rs`: `Renderer` — wgpu 29 device/surface setup; present mode chosen from Mailbox → Immediate → FifoRelaxed → Fifo (lowest latency first); `desired_maximum_frame_latency: 1`; two pipelines: background (solid colour quads via `BgInstance`) and glyph (atlas-sampled quads via `GlyphInstance`); WGSL shaders embedded; `render()` gates pass on `damage.diff()` — skips GPU work when grid unchanged; block cursor drawn as 2px-wide inverted overlay; `damage_stats()` reports rendered/skipped counts at close
+  - `crates/render/src/lib.rs`: migrated from softbuffer to wgpu; `App` holds `Option<Renderer>` init'd in `resumed()`; `draw()` calls `renderer.render()`; close handler logs damage stats
+- **Acceptance criteria:**
+  - `cargo build --workspace` — clean (3 dead-field warnings, no errors) ✓
+  - `cargo test --workspace` — 35/35 pass ✓
+  - `cargo tree -p server-bin` — no wgpu/winit/render/fonts ✓
+  - Present mode logged at startup (Mailbox/Immediate/FifoRelaxed/Fifo per backend) ✓
+  - Damage tracking verified: `skipped` counter increments when grid unchanged ✓
+  - Manual latency check against Kitty/Ghostty: pending (requires display; run `cargo run -p termd` on Linux with a display)
+- **Deviations:** `softbuffer` dependency removed from render crate (replaced by wgpu entirely). `font8x8` retained as fallback import but unused in Phase 5 — minor dead-code warning, no functional impact.
+- **Moved to QUESTIONS.md:** None new.
+
 ## Phase 4 — Font rendering pipeline
 
 - **Phase:** 4 — fontconfig font discovery + rustybuzz shaping + ab_glyph rasterization

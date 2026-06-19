@@ -1,13 +1,12 @@
-// Phase 4 — real font rendering via fontconfig + rustybuzz + ab_glyph, with
-//           font8x8 kept as a character-level fallback for unparseable glyphs.
+// Phase 5 — GPU rendering via wgpu (glyph atlas, damage tracking, Mailbox/Immediate present).
+// Phase 4 font pipeline (fontconfig + rustybuzz + ab_glyph) feeds the atlas.
 // Client-only: must never appear in server-bin's dependency tree.
 
 mod colors;
+mod gpu;
 mod keys;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::num::NonZeroU32;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,16 +17,17 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 
-use fonts::{FontSystem, RasterizedGlyph};
+use fonts::FontSystem;
 use vt::Terminal;
+
+use gpu::Renderer;
 
 const INIT_COLS: usize = 80;
 const INIT_ROWS: usize = 24;
-// Fallback cell size used when FontSystem initialisation fails.
-const FALLBACK_CELL_W: u32 = 8;
-const FALLBACK_CELL_H: u32 = 16;
+// Font size in pixels (ascent + descent).
+const FONT_PX: f32 = 16.0;
 
 #[derive(Error, Debug)]
 pub enum RenderError {
@@ -43,14 +43,8 @@ struct App {
     terminal:      Arc<Mutex<Terminal>>,
     socket_writer: Arc<Mutex<Option<UnixStream>>>,
     modifiers:     ModifiersState,
-    window:        Option<Arc<Window>>,
-    context:       Option<softbuffer::Context<Arc<Window>>>,
-    surface:       Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    // Phase 4: real font pipeline.  None only if fontconfig is unavailable.
     font_system:   Option<FontSystem>,
-    // Cached rasterized glyphs keyed by char.  None = confirmed unparseable,
-    // so we fall back to font8x8 without retrying on every frame.
-    glyph_cache:   HashMap<char, Option<RasterizedGlyph>>,
+    renderer:      Option<Renderer>,
     cell_w:        u32,
     cell_h:        u32,
     cell_ascent:   u32,
@@ -60,6 +54,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let w = (INIT_COLS as u32) * self.cell_w;
         let h = (INIT_ROWS as u32) * self.cell_h;
+
         let attrs = WindowAttributes::default()
             .with_title("Termy")
             .with_inner_size(PhysicalSize::new(w, h))
@@ -73,30 +68,26 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let ctx = match softbuffer::Context::new(win.clone()) {
-            Ok(c) => c,
+
+        let renderer = pollster::block_on(Renderer::new(win.clone(), w, h));
+        match renderer {
+            Ok(r) => self.renderer = Some(r),
             Err(e) => {
-                eprintln!("[render] softbuffer context failed: {e}");
+                eprintln!("[render] GPU init failed: {e}");
                 event_loop.exit();
-                return;
             }
-        };
-        let surf = match softbuffer::Surface::new(&ctx, win.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[render] softbuffer surface failed: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-        self.context = Some(ctx);
-        self.surface = Some(surf);
-        self.window  = Some(win);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(r) = &self.renderer {
+                    let (rendered, skipped) = r.damage_stats();
+                    eprintln!("[render] damage stats: {rendered} frames rendered, {skipped} skipped (unchanged)");
+                }
+                event_loop.exit();
+            }
 
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -106,7 +97,10 @@ impl ApplicationHandler for App {
                 let cols = ((size.width  / self.cell_w) as usize).max(1);
                 let rows = ((size.height / self.cell_h) as usize).max(1);
                 self.terminal.lock().unwrap().resize(rows, cols);
-                if let Some(w) = &self.window { w.request_redraw(); }
+                if let Some(r) = &mut self.renderer {
+                    r.resize(size.width, size.height);
+                }
+                self.draw();
             }
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -125,166 +119,35 @@ impl ApplicationHandler for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        if let Some(w) = &self.window { w.request_redraw(); }
+        self.draw();
     }
 }
 
 impl App {
     fn draw(&mut self) {
-        let Some(surf) = self.surface.as_mut() else { return };
-        let Some(win)  = self.window.as_ref()   else { return };
-
-        let size   = win.inner_size();
-        let width  = size.width;
-        let height = size.height;
-        if width == 0 || height == 0 { return; }
-
-        if surf.resize(
-            NonZeroU32::new(width).unwrap(),
-            NonZeroU32::new(height).unwrap(),
-        ).is_err() { return; }
-
-        let Ok(mut buf) = surf.buffer_mut() else { return };
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let Some(fs)       = self.font_system.as_ref() else { return };
         let term = self.terminal.lock().unwrap();
-        let rows = term.screen.rows();
-        let cols = term.screen.cols();
-        let cell_w    = self.cell_w;
-        let cell_h    = self.cell_h;
-        let cell_asc  = self.cell_ascent;
-
-        buf.fill(0x000000);
-
-        for row in 0..rows {
-            for col in 0..cols {
-                let cell = term.screen.cell(row, col);
-                let (fg, bg) = if cell.attrs.inverse {
-                    (colors::to_argb(cell.attrs.bg, false), colors::to_argb(cell.attrs.fg, true))
-                } else {
-                    (colors::to_argb(cell.attrs.fg, true),  colors::to_argb(cell.attrs.bg, false))
-                };
-
-                let px = (col as u32) * cell_w;
-                let py = (row as u32) * cell_h;
-
-                // Fill background rectangle.
-                if bg != 0x000000 {
-                    for dy in 0..cell_h {
-                        for dx in 0..cell_w {
-                            let x = px + dx;
-                            let y = py + dy;
-                            if x < width && y < height {
-                                buf[(y * width + x) as usize] = bg;
-                            }
-                        }
-                    }
-                }
-
-                // Render glyph: real font first, font8x8 as fallback.
-                if cell.ch != ' ' {
-                    let rg = self.glyph_cache.entry(cell.ch).or_insert_with(|| {
-                        self.font_system
-                            .as_ref()
-                            .and_then(|fs| fs.rasterize(cell.ch))
-                    });
-
-                    if let Some(rg) = rg.as_ref() {
-                        // Baseline-relative placement.
-                        // bearing_y is upward distance from baseline to top of bitmap.
-                        let bx = rg.bearing_x;
-                        let by = rg.bearing_y as i32;
-                        let base_y = (py + cell_asc) as i32;
-
-                        for gy in 0..rg.height {
-                            for gx in 0..rg.width {
-                                let cov = rg.pixels[(gy * rg.width + gx) as usize];
-                                if cov == 0 { continue; }
-                                let sx = px as i32 + bx + gx as i32;
-                                let sy = base_y - by + gy as i32;
-                                if sx < 0 || sy < 0 { continue; }
-                                let sx = sx as u32;
-                                let sy = sy as u32;
-                                if sx >= width || sy >= height { continue; }
-
-                                let idx = (sy * width + sx) as usize;
-                                if cov == 255 {
-                                    buf[idx] = fg;
-                                } else {
-                                    // Alpha-blend coverage over the existing background pixel.
-                                    let dst = buf[idx];
-                                    let a = cov as u32;
-                                    let ia = 255 - a;
-                                    let r = (((fg >> 16) & 0xFF) * a + ((dst >> 16) & 0xFF) * ia) / 255;
-                                    let g = (((fg >>  8) & 0xFF) * a + ((dst >>  8) & 0xFF) * ia) / 255;
-                                    let b = ((fg & 0xFF) * a + (dst & 0xFF) * ia) / 255;
-                                    buf[idx] = (r << 16) | (g << 8) | b;
-                                }
-                            }
-                        }
-                    } else {
-                        // font8x8 fallback: 8×8 bitmap stretched to cell dimensions.
-                        let glyph_idx = if (cell.ch as u32) < 128 {
-                            cell.ch as usize
-                        } else {
-                            b'?' as usize
-                        };
-                        let bitmap = font8x8::legacy::BASIC_LEGACY[glyph_idx];
-                        let scale_x = cell_w.max(8) / 8;
-                        let scale_y = cell_h.max(8) / 8;
-                        for (gy, row_byte) in bitmap.iter().enumerate() {
-                            for bit in 0..8u32 {
-                                if (row_byte >> (7 - bit)) & 1 == 0 { continue; }
-                                for sy in 0..scale_y {
-                                    for sx in 0..scale_x {
-                                        let x = px + bit * scale_x + sx;
-                                        let y = py + (gy as u32) * scale_y + sy;
-                                        if x < width && y < height {
-                                            buf[(y * width + x) as usize] = fg;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Full-height block cursor (2 px wide) via XOR invert.
-        let cur = term.screen.cursor();
-        if cur.visible && cur.row < rows && cur.col < cols {
-            let px = (cur.col as u32) * cell_w;
-            let py = (cur.row as u32) * cell_h;
-            for dy in 0..cell_h {
-                for dx in 0..2u32 {
-                    let x = px + dx;
-                    let y = py + dy;
-                    if x < width && y < height {
-                        buf[(y * width + x) as usize] ^= 0x00_FF_FF_FF;
-                    }
-                }
-            }
-        }
-
-        drop(term);
-        let _ = buf.present();
+        renderer.render(&term, fs, self.cell_w, self.cell_h, self.cell_ascent);
     }
 }
 
-/// Connect to (or auto-start) the server at `socket_path`, open a window,
+/// Connect to (or auto-start) the server at `socket_path`, open a GPU window,
 /// and run the render loop. Blocks until the window is closed.
 pub fn run_window(socket_path: &str) -> Result<(), RenderError> {
     let stream = connect_or_start(socket_path)?;
     let writer = stream.try_clone()?;
 
-    // Initialise the font pipeline. Fall back to font8x8 metrics if unavailable.
-    let (font_system, cell_w, cell_h, cell_ascent) = match FontSystem::new(16.0) {
+    // Initialise font pipeline; fall back to reasonable defaults if unavailable.
+    let (font_system, cell_w, cell_h, cell_ascent) = match FontSystem::new(FONT_PX) {
         Ok(fs) => {
             let m = fs.metrics();
+            eprintln!("[render] font metrics: {}×{} cells, ascent={}", m.cell_w, m.cell_h, m.ascent);
             (Some(fs), m.cell_w, m.cell_h, m.ascent)
         }
         Err(e) => {
-            eprintln!("[render] font system unavailable ({e}), using bitmap fallback");
-            (None, FALLBACK_CELL_W, FALLBACK_CELL_H, 13u32)
+            eprintln!("[render] font system unavailable ({e}), using defaults");
+            (None, 8u32, 16u32, 13u32)
         }
     };
 
@@ -312,12 +175,9 @@ pub fn run_window(socket_path: &str) -> Result<(), RenderError> {
     let mut app = App {
         terminal,
         socket_writer,
-        modifiers:   ModifiersState::empty(),
-        window:      None,
-        context:     None,
-        surface:     None,
+        modifiers: ModifiersState::empty(),
         font_system,
-        glyph_cache: HashMap::new(),
+        renderer:    None,
         cell_w,
         cell_h,
         cell_ascent,
