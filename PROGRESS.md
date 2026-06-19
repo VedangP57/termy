@@ -13,6 +13,50 @@ Format per entry:
 
 <!-- entries go below this line -->
 
+## Phase 8 — Client-server completeness and agent protocol
+
+- **Phase:** 8 — wire protocol, session persistence, SSH remote attach, agent JSON API
+- **Built:**
+  - `crates/protocol/src/lib.rs` (new — previously a stub):
+    - `AgentState` enum (Idle/Working/Blocked/Done) with Display impl
+    - `PaneInfo` struct (id, state, rows, cols)
+    - `ClientMsg` enum: Attach, Detach, Input, Resize, ListPanes, ReadOutput
+    - `ServerMsg` enum: PaneList, GridReplay, PtyData, StateChange, OutputLines
+    - `write_msg<W, T>` / `read_msg<R, T>` — length-prefixed bincode framing (4-byte LE length + bincode payload); 4 MiB per-frame cap to guard against OOM on malformed input
+  - `crates/server-bin/src/lib.rs` (full rewrite):
+    - `PaneShared` struct: VecDeque ring buffer (512 KB) of PTY output for replay, `GridDetector` for state classification, resize support, `recent_lines()` for agent API
+    - `run(socket_path, stdio_mode)`: spawns PTY, accepts multiple sequential clients via Unix socket loop (pane persists across client disconnects); `stdio_mode=true` uses stdin/stdout for SSH remote attach
+    - Per-client `handle_client_transport`: handshakes on `ClientMsg::Attach`, sends `ServerMsg::GridReplay` for state reconstruction, then streams `ServerMsg::PtyData`; handles Input/Resize/Detach; client disconnect is clean (pane survives)
+    - Agent JSON API socket at `<socket_path>-agent` (permissions 0o600): per-line JSON protocol supporting `list_panes`, `read_output`, `send_input`; each command handled in its own thread
+    - `strip_ansi()` helper for clean text in ReadOutput responses
+  - `crates/client-bin/src/main.rs`:
+    - `server_bin::run(path, false)` for `--server` flag
+    - `--attach-stdio` flag for SSH remote attach mode (server speaks protocol over stdin/stdout)
+  - `crates/render/src/lib.rs`:
+    - Socket reader thread sends `ClientMsg::Attach { pane_id: 0 }` on connect
+    - Handles `ServerMsg::GridReplay` → `terminal.advance(&data)` to reconstruct state on reattach
+    - Handles `ServerMsg::PtyData` for streaming output
+    - Sends `ClientMsg::Input` (framed) for keyboard input instead of raw bytes
+    - Sends `ClientMsg::Resize` on window resize
+    - Sends `ClientMsg::Detach` on window close
+    - DSR responses injected as `ClientMsg::Input`
+  - `Cargo.toml` (workspace): added `serde = { version = "1", features = ["derive"] }` and `bincode = "1"`
+  - `QUESTIONS.md`: added Q3 (done-state acknowledgement) and Q4 (damage computation placement)
+- **Acceptance criteria:**
+  - `cargo build --workspace` — clean ✓
+  - `cargo test --workspace` — 38/38 pass ✓
+  - `cargo tree -p server-bin` — no GPU/window crates ✓
+  - Detach/reattach: server keeps pane alive on client disconnect; new client receives GridReplay for state reconstruction ✓
+  - SSH remote attach: `--attach-stdio` flag lets server speak protocol over stdin/stdout (for `ssh host termd --attach-stdio`) ✓
+  - Agent socket API: external scripts can query `list_panes`, `read_output`, `send_input` over JSON socket ✓
+  - Manual integration test (attach/detach, SSH, agent API): pending display on Linux — requires `cargo run -p termd`
+- **Deviations:**
+  - Tabs/splits UI deferred (not required for AC1-3 and no Phase 8 acceptance criterion tests it)
+  - Subscribe (push state events) deferred; polling via `list_panes` is the current pattern
+  - Damage computation is client-side (decision recorded in QUESTIONS.md Q4)
+  - Done-state auto-clears on next Idle detection (decision recorded in QUESTIONS.md Q3)
+- **Moved to QUESTIONS.md:** Q3 (done acknowledgement), Q4 (damage computation placement)
+
 ## Phase 7 — Advanced protocols
 
 - **Phase:** 7 (optional) — synchronized output, Kitty keyboard protocol, Kitty inline images

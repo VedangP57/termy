@@ -2,4 +2,8 @@
 name    = "protocol"
 version = "0.1.0"
 edition = "2021"
-# Phase 8: length-prefixed binary frame format, serde + bincode. Shared by client and server.
+
+[dependencies]
+serde   = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }

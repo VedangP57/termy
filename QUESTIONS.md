@@ -47,3 +47,41 @@ At that point, a server-only build (to run headless on a remote host) would
 still link GPU code. Do you want a separate server binary eventually, or is
 a single binary that links everything (but only exercises GPU code in client
 mode) acceptable?
+
+---
+
+## Q3 — Done-state acknowledgement semantics
+**Source:** `docs/04-CLIENT-SERVER-AND-AGENT-PROTOCOL.md` § 7.1 / § 9
+
+The docs say the `done` state means "a foreground process exited, not yet
+acknowledged" but leave the acknowledgement mechanism explicitly open.
+
+**Phase 8 implementation assumption:** `done` is automatically cleared the
+next time a shell prompt is detected (i.e. shell re-enters idle). No explicit
+user/client acknowledgement is required. This means `done` is a transient
+state visible only in the brief window between process exit and the shell
+reprinting its prompt.
+
+**Question:** Is auto-clear on next-idle correct, or does `done` need an
+explicit acknowledgement action (e.g. viewing the pane, sending a specific
+API call)? If the intended UX is a persistent "this job finished" badge that
+the user must dismiss, the auto-clear approach is wrong.
+
+---
+
+## Q4 — Damage-region computation: server-side or client-side?
+**Source:** `docs/04-CLIENT-SERVER-AND-AGENT-PROTOCOL.md` § 6.2 / § 9
+
+The docs defer this decision to Phase 5/8 implementation time.
+
+**Phase 8 implementation decision:** damage computation is client-side.
+Rationale: the server sends raw PTY bytes (thin framing: pane_id + length +
+raw bytes). The client parses them into its local terminal model and uses its
+existing `DamageTracker` to decide what to redraw. Server-side damage would
+require the server to hold a second terminal model just for diffing, doubling
+memory cost for no benefit — the client already owns the renderer and is the
+only consumer of damage data.
+
+**Question:** Confirm this is acceptable. If you later want the server to do
+damage computation (e.g. to support multiple simultaneous clients sharing a
+pane view), this decision needs revisiting.

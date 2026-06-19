@@ -6,7 +6,6 @@ mod colors;
 mod gpu;
 mod keys;
 
-use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +19,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use fonts::FontSystem;
+use protocol::{ClientMsg, ServerMsg, read_msg, write_msg};
 use vt::{MouseMode, Terminal};
 
 use gpu::Renderer;
@@ -61,7 +61,10 @@ struct App {
 impl App {
     fn send(&self, bytes: &[u8]) {
         if let Ok(mut g) = self.socket_writer.lock() {
-            if let Some(w) = g.as_mut() { let _ = w.write_all(bytes); }
+            if let Some(w) = g.as_mut() {
+                let msg = ClientMsg::Input { data: bytes.to_vec() };
+                let _ = write_msg(w, &msg);
+            }
         }
     }
 
@@ -138,6 +141,12 @@ impl ApplicationHandler for App {
                     let (rendered, skipped) = r.damage_stats();
                     eprintln!("[render] damage stats: {rendered} rendered, {skipped} skipped");
                 }
+                // Notify server so it can cleanly unregister this client.
+                if let Ok(mut g) = self.socket_writer.lock() {
+                    if let Some(w) = g.as_mut() {
+                        let _ = write_msg(w, &ClientMsg::Detach);
+                    }
+                }
                 event_loop.exit();
             }
 
@@ -153,6 +162,13 @@ impl ApplicationHandler for App {
                     r.resize(size.width, size.height);
                 }
                 self.scroll_offset = 0;
+                // Notify server of new dimensions.
+                if let Ok(mut g) = self.socket_writer.lock() {
+                    if let Some(w) = g.as_mut() {
+                        let msg = ClientMsg::Resize { rows: rows as u16, cols: cols as u16 };
+                        let _ = write_msg(w, &msg);
+                    }
+                }
                 self.draw();
             }
 
@@ -293,28 +309,47 @@ pub fn run_window(socket_path: &str) -> Result<(), RenderError> {
     let writer_clone = Arc::clone(&socket_writer);
     let mut read_stream = stream;
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+        // Handshake: send Attach for pane 0.
+        {
+            if let Ok(mut g) = writer_clone.lock() {
+                if let Some(w) = g.as_mut() {
+                    let _ = write_msg(w, &ClientMsg::Attach { pane_id: 0 });
+                }
+            }
+        }
+
         loop {
-            match read_stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let responses = {
-                        let mut term = term_clone.lock().unwrap();
-                        term.advance(&buf[..n]);
-                        term.drain_responses()
-                    };
-                    // Inject terminal responses (DSR, DA) back to PTY via the server.
-                    if !responses.is_empty() {
-                        if let Ok(mut w) = writer_clone.lock() {
-                            if let Some(w) = w.as_mut() {
-                                for resp in responses {
-                                    let _ = w.write_all(&resp);
-                                }
+            let msg: ServerMsg = match read_msg(&mut read_stream) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+
+            let pty_bytes: Option<Vec<u8>> = match msg {
+                ServerMsg::GridReplay { data } => Some(data),
+                ServerMsg::PtyData    { data } => Some(data),
+                ServerMsg::StateChange { .. }  => None,
+                ServerMsg::PaneList   { .. }   => None,
+                ServerMsg::OutputLines { .. }  => None,
+            };
+
+            if let Some(bytes) = pty_bytes {
+                let responses = {
+                    let mut term = term_clone.lock().unwrap();
+                    term.advance(&bytes);
+                    term.drain_responses()
+                };
+                // Inject terminal responses (DSR, DA) back to PTY via the server.
+                if !responses.is_empty() {
+                    if let Ok(mut g) = writer_clone.lock() {
+                        if let Some(w) = g.as_mut() {
+                            for resp in responses {
+                                let msg = ClientMsg::Input { data: resp };
+                                let _ = write_msg(w, &msg);
                             }
                         }
                     }
-                    let _ = proxy.send_event(());
                 }
+                let _ = proxy.send_event(());
             }
         }
     });

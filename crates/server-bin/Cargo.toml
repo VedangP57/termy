@@ -9,4 +9,6 @@ edition = "2021"
 [dependencies]
 pty       = { path = "../pty" }
 agentd    = { path = "../agentd" }
+protocol  = { path = "../protocol" }
+serde     = { workspace = true }
 thiserror = { workspace = true }

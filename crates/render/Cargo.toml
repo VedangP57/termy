@@ -12,4 +12,5 @@ bytemuck  = { version = "1", features = ["derive"] }
 font8x8   = { version = "0.2", default-features = false }
 fonts     = { path = "../fonts" }
 vt        = { path = "../vt" }
+protocol  = { path = "../protocol" }
 thiserror = { workspace = true }
