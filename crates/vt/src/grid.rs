@@ -170,6 +170,12 @@ pub struct Screen {
 
     // Queued terminal responses (DSR, DA, etc.) to be written back to PTY.
     pub pending_responses: Vec<Vec<u8>>,
+
+    // ── Phase 7: advanced protocols ─────────────────────────────────────────
+    // Synchronized output (DEC mode 2026): suppress rendering mid-update.
+    pub sync_output: bool,
+    // Kitty keyboard protocol stack (push/pop via CSI > u / CSI < u).
+    pub keyboard_modes: Vec<u32>,
 }
 
 impl Screen {
@@ -195,6 +201,8 @@ impl Screen {
             cursor_shape:    0,
             last_char:       ' ',
             pending_responses: Vec::new(),
+            sync_output:     false,
+            keyboard_modes:  Vec::new(),
         }
     }
 
@@ -257,6 +265,14 @@ impl Screen {
             }
             Action::EscDispatch { intermediates, byte } => {
                 self.esc(intermediates, byte);
+            }
+            Action::ApcDispatch(payload) => {
+                // Kitty inline-image protocol: payload starts with 'G'.
+                // Parse cleanly so display isn't corrupted; rendering is a no-op.
+                if payload.first() == Some(&b'G') {
+                    // Acknowledged: Kitty image command received; no rendering yet.
+                }
+                // All other APC payloads: silently ignore.
             }
             Action::OscDispatch(parts) => {
                 // OSC 0 / OSC 2: set window title.
@@ -585,6 +601,25 @@ impl Screen {
                 for mode in params.clone() { self.set_private_mode(mode, false); }
             }
 
+            // ── Kitty keyboard protocol ──────────────────────────────────────
+            // CSI > flags u — push mode onto stack.
+            (Some(b'>'), b'u') => {
+                let flags = params.first().copied().unwrap_or(0);
+                self.keyboard_modes.push(flags);
+            }
+            // CSI < n u — pop n entries from the stack.
+            (Some(b'<'), b'u') => {
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let new_len = self.keyboard_modes.len().saturating_sub(n);
+                self.keyboard_modes.truncate(new_len);
+            }
+            // CSI ? u — query current keyboard flags; respond with CSI ? flags u.
+            (Some(b'?'), b'u') => {
+                let flags = self.keyboard_modes.last().copied().unwrap_or(0);
+                let resp = format!("\x1b[?{}u", flags);
+                self.pending_responses.push(resp.into_bytes());
+            }
+
             _ => {}
         }
     }
@@ -656,6 +691,9 @@ impl Screen {
 
             // Bracketed paste mode.
             2004 => { self.bracketed_paste = set; }
+
+            // Synchronized output (DEC mode 2026): pause rendering mid-update.
+            2026 => { self.sync_output = set; }
 
             _ => {}
         }
@@ -880,5 +918,54 @@ mod tests {
         assert!(!s.pending_responses.is_empty());
         let resp = std::str::from_utf8(&s.pending_responses[0]).unwrap();
         assert_eq!(resp, "\x1b[5;10R");
+    }
+
+    // ── Phase 7 tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn apc_kitty_image_parsed_cleanly() {
+        // APC payload starting with 'G' (Kitty inline-image command).
+        // Should parse without corrupting any grid cells.
+        let mut s = Screen::new(24, 80);
+        feed(&mut s, b"before");
+        feed(&mut s, b"\x1b_Ga=T,f=32,s=4,v=4,m=0;AAAA\x1b\\");
+        feed(&mut s, b"after");
+        // Grid must have "before" and "after" text intact; APC leaves no cell residue.
+        assert_eq!(s.cell(0, 0).ch, 'b');
+        assert_eq!(s.cell(0, 6).ch, 'a');
+    }
+
+    #[test]
+    fn synchronized_output_mode_2026() {
+        let mut s = Screen::new(24, 80);
+        assert!(!s.sync_output);
+        feed(&mut s, b"\x1b[?2026h"); // enable synchronized output
+        assert!(s.sync_output);
+        feed(&mut s, b"\x1b[?2026l"); // disable
+        assert!(!s.sync_output);
+    }
+
+    #[test]
+    fn kitty_keyboard_protocol_push_pop_query() {
+        let mut s = Screen::new(24, 80);
+        assert!(s.keyboard_modes.is_empty());
+        // Push flags=1 (disambiguate)
+        feed(&mut s, b"\x1b[>1u");
+        assert_eq!(s.keyboard_modes, vec![1]);
+        // Push flags=3 (disambiguate + report event types)
+        feed(&mut s, b"\x1b[>3u");
+        assert_eq!(s.keyboard_modes, vec![1, 3]);
+        // Query — should respond with current top (3)
+        s.pending_responses.clear();
+        feed(&mut s, b"\x1b[?u");
+        assert!(!s.pending_responses.is_empty());
+        let resp = std::str::from_utf8(&s.pending_responses[0]).unwrap();
+        assert_eq!(resp, "\x1b[?3u");
+        // Pop 1 entry
+        feed(&mut s, b"\x1b[<1u");
+        assert_eq!(s.keyboard_modes, vec![1]);
+        // Pop remaining
+        feed(&mut s, b"\x1b[<1u");
+        assert!(s.keyboard_modes.is_empty());
     }
 }

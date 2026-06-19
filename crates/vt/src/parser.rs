@@ -21,6 +21,9 @@ pub enum Action {
         intermediates: Vec<u8>,
         byte: u8,
     },
+    /// A completed APC sequence (ESC _ … ESC \\ or ST).
+    /// Used by the Kitty inline-image protocol (payload starts with 'G').
+    ApcDispatch(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +37,10 @@ enum State {
     CsiIgnore,
     OscString,
     OscStringEscape,
-    // DCS / SOS / PM / APC are silently ignored for now.
+    // APC — Kitty inline-image protocol.
+    ApcString,
+    ApcStringEscape,
+    // DCS / SOS / PM are silently ignored.
     Ignore,
 }
 
@@ -49,6 +55,7 @@ pub struct Parser {
     private_marker: Option<u8>,
     intermediates: Vec<u8>,
     osc_buf: Vec<u8>,
+    apc_buf: Vec<u8>,
     /// UTF-8 reassembly buffer (up to 4 bytes).
     utf8_buf: [u8; 4],
     utf8_len: usize,
@@ -70,6 +77,7 @@ impl Parser {
             private_marker: None,
             intermediates: Vec::with_capacity(4),
             osc_buf: Vec::with_capacity(64),
+            apc_buf: Vec::with_capacity(256),
             utf8_buf: [0; 4],
             utf8_len: 0,
             utf8_needed: 0,
@@ -117,6 +125,8 @@ impl Parser {
             State::CsiIgnore => self.csi_ignore(b, cb),
             State::OscString => self.osc_string(b, cb),
             State::OscStringEscape => self.osc_string_escape(b, cb),
+            State::ApcString => self.apc_string(b, cb),
+            State::ApcStringEscape => self.apc_string_escape(b, cb),
             State::Ignore => {
                 // Silently consume until ST or BEL.
                 if b == 0x07 || b == 0x9C {
@@ -181,9 +191,14 @@ impl Parser {
                 self.osc_buf.clear();
                 self.state = State::OscString;
             }
-            0x50 | 0x58 | 0x5E | 0x5F => {
-                // DCS, SOS, PM, APC — ignore until ST.
+            0x50 | 0x58 | 0x5E => {
+                // DCS, SOS, PM — ignore until ST.
                 self.state = State::Ignore;
+            }
+            0x5F => {
+                // APC (ESC _) — Kitty inline-image protocol.
+                self.apc_buf.clear();
+                self.state = State::ApcString;
             }
             0x1B => {
                 // ESC ESC — stay in Escape for the next byte.
@@ -361,6 +376,43 @@ impl Parser {
         let parts: Vec<Vec<u8>> = self.osc_buf.splitn(2, |&b| b == b';').map(|s| s.to_vec()).collect();
         cb(Action::OscDispatch(parts));
         self.osc_buf.clear();
+        self.state = State::Ground;
+    }
+
+    fn apc_string(&mut self, b: u8, cb: &mut dyn FnMut(Action)) {
+        match b {
+            0x1B => {
+                self.state = State::ApcStringEscape;
+            }
+            0x9C => {
+                // C1 ST — terminates APC.
+                self.dispatch_apc(cb);
+            }
+            0x07 => {
+                // BEL — some implementations use this as terminator.
+                self.dispatch_apc(cb);
+            }
+            _ => {
+                self.apc_buf.push(b);
+            }
+        }
+    }
+
+    fn apc_string_escape(&mut self, b: u8, cb: &mut dyn FnMut(Action)) {
+        if b == 0x5C {
+            // ESC \ = ST — terminates APC.
+            self.dispatch_apc(cb);
+        } else {
+            // Not a valid ST; treat ESC as a literal and keep collecting.
+            self.apc_buf.push(0x1B);
+            self.apc_buf.push(b);
+            self.state = State::ApcString;
+        }
+    }
+
+    fn dispatch_apc(&mut self, cb: &mut dyn FnMut(Action)) {
+        cb(Action::ApcDispatch(self.apc_buf.clone()));
+        self.apc_buf.clear();
         self.state = State::Ground;
     }
 }

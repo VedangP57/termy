@@ -69,6 +69,8 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let Some(fs)       = self.font_system.as_ref() else { return };
         let term = self.terminal.lock().unwrap();
+        // Synchronized output (mode 2026): suppress frame while app is mid-update.
+        if term.screen.sync_output { return; }
         renderer.render(&term, fs, self.cell_w, self.cell_h, self.cell_ascent, self.scroll_offset);
     }
 
@@ -158,11 +160,12 @@ impl ApplicationHandler for App {
                 // Any keypress cancels scrollback view.
                 self.scroll_offset = 0;
 
-                let (app_cursor, app_kp) = {
+                let (app_cursor, app_kp, kb_flags) = {
                     let t = self.terminal.lock().unwrap();
-                    (t.screen.app_cursor_keys, t.screen.app_keypad)
+                    let flags = t.screen.keyboard_modes.last().copied().unwrap_or(0);
+                    (t.screen.app_cursor_keys, t.screen.app_keypad, flags)
                 };
-                let bytes = keys::to_bytes(&event, self.modifiers, app_cursor, app_kp);
+                let bytes = keys::to_bytes(&event, self.modifiers, app_cursor, app_kp, kb_flags);
                 if !bytes.is_empty() {
                     self.send(&bytes);
                 }

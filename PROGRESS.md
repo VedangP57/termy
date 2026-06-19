@@ -13,6 +13,36 @@ Format per entry:
 
 <!-- entries go below this line -->
 
+## Phase 7 — Advanced protocols
+
+- **Phase:** 7 (optional) — synchronized output, Kitty keyboard protocol, Kitty inline images
+- **Built:**
+  - `crates/vt/src/parser.rs`:
+    - `ApcDispatch(Vec<u8>)` variant added to `Action` enum
+    - `ApcString` / `ApcStringEscape` states added to `State` enum
+    - `apc_buf: Vec<u8>` field on `Parser`
+    - `escape()`: `0x5F` (APC) now routes to `ApcString` instead of `Ignore`
+    - `apc_string()` / `apc_string_escape()` / `dispatch_apc()` methods: collect APC payload until ESC \\ or ST, emit `ApcDispatch`
+  - `crates/vt/src/grid.rs`:
+    - `Screen` gains `sync_output: bool` and `keyboard_modes: Vec<u32>`
+    - `process()`: `ApcDispatch` handled — Kitty `G`-prefix payload parsed cleanly (no-op rendering); other APC payloads silently ignored
+    - `csi()`: Kitty keyboard protocol — `CSI > flags u` push, `CSI < n u` pop, `CSI ? u` query (queues `\e[?{flags}u` response)
+    - `set_private_mode()`: DEC mode 2026 (synchronized output) sets/clears `sync_output`
+    - 3 new unit tests: `apc_kitty_image_parsed_cleanly`, `synchronized_output_mode_2026`, `kitty_keyboard_protocol_push_pop_query`
+  - `crates/render/src/keys.rs`:
+    - `to_bytes` gains `keyboard_flags: u32` parameter
+    - When `keyboard_flags & 1` (disambiguate): ctrl+char sends `CSI codepoint ; mods u`; modified Enter/Tab/Escape/Backspace send `CSI codepoint ; mods u`
+  - `crates/render/src/lib.rs`:
+    - `draw()` suppresses rendering when `term.screen.sync_output` is set
+    - Keypress reads `keyboard_modes.last()` and passes flags to `keys::to_bytes`
+- **Acceptance criteria:**
+  - `cargo build --workspace` — clean (3 pre-existing dead-code warnings only) ✓
+  - `cargo test --workspace` — 38/38 pass ✓
+  - `cargo tree -p server-bin` — no GPU/window crates ✓
+  - Unit tests for all three features ✓
+- **Deviations:** Kitty inline-image rendering is a no-op (parsing only). Per `03-BUILD-PHASES.md` Phase 7: "add incrementally, only as a real need surfaces" — full image rendering deferred.
+- **Moved to QUESTIONS.md:** None.
+
 ## Phase 6 — Terminal feature completeness
 
 - **Phase:** 6 — mouse reporting, bracketed paste, app cursor keys, DSR, scrollback nav, window title, DECSCUSR, REP
