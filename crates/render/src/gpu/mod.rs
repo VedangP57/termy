@@ -369,15 +369,20 @@ impl Renderer {
     }
 
     /// Render one frame.  Returns false when nothing changed (damage gate skipped the pass).
+    ///
+    /// `scroll_offset` is the number of lines scrolled back (0 = live view).
+    /// When non-zero the damage gate is bypassed and no cursor is drawn.
     pub fn render(
         &mut self,
-        term:   &Terminal,
-        fonts:  &FontSystem,
-        cell_w: u32,
-        cell_h: u32,
-        ascent: u32,
+        term:         &Terminal,
+        fonts:        &FontSystem,
+        cell_w:       u32,
+        cell_h:       u32,
+        ascent:       u32,
+        scroll_offset: usize,
     ) -> bool {
-        if !self.damage.diff(term) {
+        // Damage gate — only skip when in live view and grid is unchanged.
+        if scroll_offset == 0 && !self.damage.diff(term) {
             self.damage.skipped += 1;
             return false;
         }
@@ -395,7 +400,15 @@ impl Renderer {
 
         for row in 0..rows {
             for col in 0..cols {
-                let cell = term.screen.cell(row, col);
+                // Resolve cell: either from live grid or scrollback when scrolled.
+                let cell = if scroll_offset == 0 {
+                    term.screen.cell(row, col).clone()
+                } else {
+                    term.screen.display_cell(row, col, scroll_offset)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+
                 let (fg_col, bg_col) = if cell.attrs.inverse {
                     (cell.attrs.bg, cell.attrs.fg)
                 } else {
@@ -409,7 +422,8 @@ impl Renderer {
 
                 bg_insts.push(BgInstance { pos: [px, py], size: [cw, ch], col: bg });
 
-                let is_cursor = cur.visible && cur.row == row && cur.col == col;
+                // Only draw cursor in live view.
+                let is_cursor = scroll_offset == 0 && cur.visible && cur.row == row && cur.col == col;
                 if is_cursor {
                     let inv = [1.0 - bg[0], 1.0 - bg[1], 1.0 - bg[2], 1.0f32];
                     bg_insts.push(BgInstance { pos: [px, py], size: [2.0, ch], col: inv });
@@ -418,7 +432,8 @@ impl Renderer {
                 if cell.ch != ' ' {
                     let rg_opt = fonts.rasterize(cell.ch);
                     let rg_ref = rg_opt.as_ref();
-                    if let Some(e) = self.atlas.get_or_insert(cell.ch, rg_ref, &self.queue) {
+                    let q      = &self.queue;
+                    if let Some(e) = self.atlas.get_or_insert(cell.ch, rg_ref, q) {
                         let gx = px + e.bearing_x as f32;
                         let gy = py + (asc - e.bearing_y) as f32;
                         glyph_insts.push(GlyphInstance {

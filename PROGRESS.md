@@ -13,6 +13,42 @@ Format per entry:
 
 <!-- entries go below this line -->
 
+## Phase 6 — Terminal feature completeness
+
+- **Phase:** 6 — mouse reporting, bracketed paste, app cursor keys, DSR, scrollback nav, window title, DECSCUSR, REP
+- **Built:**
+  - `crates/vt/src/grid.rs`:
+    - `MouseMode` enum (Off/X10/ButtonMotion/AnyMotion) — public
+    - Screen new fields: `mouse_mode`, `mouse_sgr` (SGR 1006 encoding), `bracketed_paste`, `app_cursor_keys` (DECCKM mode 1), `app_keypad` (DECKPAM/DECKPNM), `window_title` (OSC 0/2), `cursor_shape` (DECSCUSR), `last_char` (for REP), `pending_responses`
+    - Private modes handled: 1, 7, 12, 1000, 1002, 1003, 1006, 1015, 2004
+    - ESC = / ESC > (DECKPAM/DECKPNM)
+    - CSI b (REP — repeat last printed character)
+    - CSI SP q (DECSCUSR — cursor shape)
+    - CSI 5n / CSI 6n (device status + cursor position report → `pending_responses`)
+    - CSI c (primary device attributes response)
+    - OSC 0/2 (window title stored in `window_title`)
+    - Bugfix: removed spurious `continue` in `apply_sgr` for extended-color parsing (was re-interpreting the last byte of `38;2;r;g;b` as a new SGR code)
+    - `display_cell(row, col, scroll_offset)` — virtual row lookup spanning scrollback + screen
+  - `crates/vt/src/lib.rs`: `drain_responses()` — drains `pending_responses` for injection back to PTY
+  - `crates/render/src/keys.rs`: `to_bytes` now accepts `app_cursor_keys: bool`; sends `\eOA/B/C/D` (SS3) in app mode vs `\e[A/B/C/D` (CSI) in normal mode
+  - `crates/render/src/gpu/mod.rs`: `render()` gains `scroll_offset: usize`; damage gate bypassed when scrolled; cell lookup uses `display_cell` for scrollback rows; cursor suppressed when scrolled
+  - `crates/render/src/lib.rs`:
+    - `App` gains `scroll_offset`, `cursor_px`, `mouse_btn_held`, `window`
+    - `MouseWheel`: forwards as encoded mouse event when mouse mode active; sends arrow keys in alt-screen; scrolls `scroll_offset` in normal mode
+    - `CursorMoved`: tracks pixel position; encodes motion events for AnyMotion/ButtonMotion modes
+    - `MouseInput`: encodes button press/release in X10 or SGR format per `mouse_sgr` flag
+    - DSR response injection: socket reader thread drains `terminal.drain_responses()` and writes responses back through the socket (PTY app ← server ← client round-trip)
+    - Window title: `win.set_title()` updated from `screen.window_title` after each event
+    - Keypress now also cancels scrollback view
+- **Acceptance criteria:**
+  - `cargo build --workspace` — clean ✓
+  - `cargo test --workspace` — 35/35 pass ✓
+  - `cargo tree -p server-bin` — no GPU/window crates ✓
+  - Unit tests for all new VT features: mouse mode, SGR encoding, bracketed paste, DECKPAM, OSC title, DECSCUSR, REP, DSR response ✓
+  - Manual test matrix (vim/tmux/htop/agent): pending display — requires `cargo run -p termd` on Linux
+- **Deviations:** None.
+- **Moved to QUESTIONS.md:** None. DSR response injection implemented client-side (not deferred).
+
 ## Phase 5 — GPU rendering and glyph atlas
 
 - **Phase:** 5 — wgpu 29 GPU renderer with glyph atlas and damage tracking

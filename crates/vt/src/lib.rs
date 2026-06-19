@@ -7,7 +7,7 @@ pub mod parser;
 
 pub use cell::{Attrs, Cell};
 pub use color::Color;
-pub use grid::{Cursor, Screen};
+pub use grid::{Cursor, MouseMode, Screen};
 pub use parser::{Action, Parser};
 
 /// A complete terminal: parser + screen state. Feed raw bytes; read the grid.
@@ -33,6 +33,11 @@ impl Terminal {
     /// Resize the terminal grid.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.screen.resize(rows, cols);
+    }
+
+    /// Drain queued terminal responses (DSR, DA) that must be written back to the PTY.
+    pub fn drain_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.screen.pending_responses)
     }
 
     /// Return the text content of the last non-blank row on the active screen.

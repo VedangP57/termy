@@ -2,7 +2,10 @@ use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Translate a winit key-press event into the byte sequence the PTY expects.
-pub fn to_bytes(event: &KeyEvent, mods: ModifiersState) -> Vec<u8> {
+///
+/// `app_cursor_keys`: DECCKM mode 1 — arrows send SS3 (ESC O …) instead of CSI (ESC [ …).
+/// `app_keypad`:      DECKPAM — numpad keys send application sequences.
+pub fn to_bytes(event: &KeyEvent, mods: ModifiersState, app_cursor_keys: bool, _app_keypad: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let ctrl = mods.control_key();
 
@@ -23,11 +26,26 @@ pub fn to_bytes(event: &KeyEvent, mods: ModifiersState) -> Vec<u8> {
             out.extend_from_slice(s.as_bytes());
         }
         Key::Named(name) => {
+            // Arrow keys: CSI in normal mode, SS3 in application-cursor-keys mode.
+            if app_cursor_keys {
+                let seq: &[u8] = match name {
+                    NamedKey::ArrowUp    => b"\x1bOA",
+                    NamedKey::ArrowDown  => b"\x1bOB",
+                    NamedKey::ArrowRight => b"\x1bOC",
+                    NamedKey::ArrowLeft  => b"\x1bOD",
+                    _ => b"",
+                };
+                if !seq.is_empty() {
+                    out.extend_from_slice(seq);
+                    return out;
+                }
+            }
+
             let seq: &[u8] = match name {
                 NamedKey::Enter        => b"\r",
                 NamedKey::Backspace    => b"\x7f",
                 NamedKey::Delete       => b"\x1b[3~",
-                NamedKey::Tab         => b"\t",
+                NamedKey::Tab          => b"\t",
                 NamedKey::Escape       => b"\x1b",
                 NamedKey::ArrowUp      => b"\x1b[A",
                 NamedKey::ArrowDown    => b"\x1b[B",

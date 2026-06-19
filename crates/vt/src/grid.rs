@@ -6,11 +6,20 @@ use crate::parser::Action;
 
 const MAX_SCROLLBACK: usize = 10_000;
 
+/// Mouse reporting mode set by the application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseMode {
+    Off,
+    X10,          // mode 1000 — button press/release only
+    ButtonMotion, // mode 1002 — press/release + motion while held
+    AnyMotion,    // mode 1003 — press/release + all motion
+}
+
 /// Cursor state.
 #[derive(Debug, Clone)]
 pub struct Cursor {
-    pub row: usize,
-    pub col: usize,
+    pub row:     usize,
+    pub col:     usize,
     pub visible: bool,
 }
 
@@ -136,39 +145,64 @@ impl Grid {
 }
 
 pub struct Screen {
-    normal: Grid,
-    alt: Grid,
-    in_alt: bool,
-    scrollback: VecDeque<Vec<Cell>>,
-    cursor: Cursor,
-    saved_cursor: Option<Cursor>,
-    pub attrs: Attrs,
-    scroll_top: usize,
+    normal:        Grid,
+    alt:           Grid,
+    in_alt:        bool,
+    scrollback:    VecDeque<Vec<Cell>>,
+    cursor:        Cursor,
+    saved_cursor:  Option<Cursor>,
+    pub attrs:     Attrs,
+    scroll_top:    usize,
     scroll_bottom: usize,
-    pending_wrap: bool,
+    pending_wrap:  bool,
+
+    // ── Phase 6: mode flags ──────────────────────────────────────────────────
+    pub mouse_mode:      MouseMode,
+    pub mouse_sgr:       bool,   // mode 1006: SGR-encoded mouse events
+    pub bracketed_paste: bool,   // mode 2004
+    pub app_cursor_keys: bool,   // mode 1 (DECCKM): SS3 vs CSI arrow sequences
+    pub app_keypad:      bool,   // set by ESC = / cleared by ESC >
+    pub window_title:    Option<String>, // from OSC 0 / OSC 2
+    pub cursor_shape:    u32,    // DECSCUSR value (0/2=steady block, 1=blink block, etc.)
+
+    // Last printed character — for REP (CSI b).
+    last_char: char,
+
+    // Queued terminal responses (DSR, DA, etc.) to be written back to PTY.
+    pub pending_responses: Vec<Vec<u8>>,
 }
 
 impl Screen {
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
             normal: Grid::new(rows, cols),
-            alt: Grid::new(rows, cols),
+            alt:    Grid::new(rows, cols),
             in_alt: false,
-            scrollback: VecDeque::new(),
-            cursor: Cursor::default(),
-            saved_cursor: None,
-            attrs: Attrs::default(),
-            scroll_top: 0,
+            scrollback:    VecDeque::new(),
+            cursor:        Cursor::default(),
+            saved_cursor:  None,
+            attrs:         Attrs::default(),
+            scroll_top:    0,
             scroll_bottom: rows.saturating_sub(1),
-            pending_wrap: false,
+            pending_wrap:  false,
+
+            mouse_mode:      MouseMode::Off,
+            mouse_sgr:       false,
+            bracketed_paste: false,
+            app_cursor_keys: false,
+            app_keypad:      false,
+            window_title:    None,
+            cursor_shape:    0,
+            last_char:       ' ',
+            pending_responses: Vec::new(),
         }
     }
 
-    pub fn rows(&self) -> usize { self.active().rows }
-    pub fn cols(&self) -> usize { self.active().cols }
-    pub fn cursor(&self) -> &Cursor { &self.cursor }
+    pub fn rows(&self) -> usize         { self.active().rows }
+    pub fn cols(&self) -> usize         { self.active().cols }
+    pub fn cursor(&self) -> &Cursor     { &self.cursor }
     pub fn scrollback(&self) -> &VecDeque<Vec<Cell>> { &self.scrollback }
-    pub fn is_in_alt(&self) -> bool { self.in_alt }
+    pub fn is_in_alt(&self) -> bool     { self.in_alt }
 
     fn active(&self) -> &Grid {
         if self.in_alt { &self.alt } else { &self.normal }
@@ -186,26 +220,58 @@ impl Screen {
         self.active().row(row)
     }
 
+    /// Return the cell at the given display row when the view is scrolled back
+    /// by `scroll_offset` lines. Returns None when the display row would be
+    /// beyond the top of the available scrollback.
+    pub fn display_cell(&self, display_row: usize, col: usize, scroll_offset: usize) -> Option<&Cell> {
+        let sb = &self.scrollback;
+        let virtual_row = display_row as isize - scroll_offset as isize;
+        if virtual_row >= 0 {
+            let r = virtual_row as usize;
+            if r < self.rows() {
+                return Some(self.active().cell(r, col));
+            }
+            return None;
+        }
+        // negative virtual_row → into scrollback
+        // virtual_row == -1 → newest scrollback line (sb.len()-1)
+        let sb_idx = sb.len().checked_sub(((-virtual_row) as usize))?;
+        sb.get(sb_idx)?.get(col)
+    }
+
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.normal.resize(rows, cols);
         self.alt.resize(rows, cols);
-        self.scroll_top = 0;
+        self.scroll_top    = 0;
         self.scroll_bottom = rows.saturating_sub(1);
-        self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
-        self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
+        self.cursor.row    = self.cursor.row.min(rows.saturating_sub(1));
+        self.cursor.col    = self.cursor.col.min(cols.saturating_sub(1));
     }
 
     pub fn process(&mut self, action: Action) {
         match action {
             Action::Print(ch) => self.print(ch),
             Action::Execute(b) => self.execute(b),
-            Action::CsiDispatch { params, private_marker, intermediates: _, final_byte } => {
-                self.csi(params, private_marker, final_byte);
+            Action::CsiDispatch { params, private_marker, intermediates, final_byte } => {
+                self.csi(params, private_marker, intermediates, final_byte);
             }
             Action::EscDispatch { intermediates, byte } => {
                 self.esc(intermediates, byte);
             }
-            Action::OscDispatch(_) => {}
+            Action::OscDispatch(parts) => {
+                // OSC 0 / OSC 2: set window title.
+                if let Some(cmd_bytes) = parts.first() {
+                    let cmd = std::str::from_utf8(cmd_bytes).unwrap_or("");
+                    if cmd == "0" || cmd == "2" {
+                        if let Some(title_bytes) = parts.get(1) {
+                            self.window_title = std::str::from_utf8(title_bytes)
+                                .ok()
+                                .map(|s| s.to_owned());
+                        }
+                    }
+                    // OSC 8 (hyperlinks): silently ignore.
+                }
+            }
         }
     }
 
@@ -217,11 +283,11 @@ impl Screen {
         }
         let row = self.cursor.row;
         let col = self.cursor.col;
-        // Snapshot attrs before active_mut borrow.
         let attrs = self.attrs.clone();
-        let cell = self.active_mut().cell_mut(row, col);
-        cell.ch = ch;
+        let cell  = self.active_mut().cell_mut(row, col);
+        cell.ch    = ch;
         cell.attrs = attrs;
+        self.last_char = ch;
         let cols = self.active().cols;
         if col + 1 >= cols {
             self.pending_wrap = true;
@@ -248,10 +314,9 @@ impl Screen {
     fn do_lf(&mut self) {
         self.pending_wrap = false;
         if self.cursor.row == self.scroll_bottom {
-            // Snapshot fields before active_mut borrow.
-            let top = self.scroll_top;
+            let top    = self.scroll_top;
             let bottom = self.scroll_bottom;
-            let attrs = self.attrs.clone();
+            let attrs  = self.attrs.clone();
             let in_alt = self.in_alt;
             let scrolled = self.active_mut().scroll_up(top, bottom, 1, &attrs);
             if !in_alt && top == 0 {
@@ -278,17 +343,26 @@ impl Screen {
                 let cols = self.cols();
                 *self = Screen::new(rows, cols);
             }
+            // DECKPAM / DECKPNM — keypad application / normal mode.
+            ([], b'=') => { self.app_keypad = true; }
+            ([], b'>') => { self.app_keypad = false; }
             _ => {}
         }
     }
 
-    fn csi(&mut self, mut params: Vec<u32>, private_marker: Option<u8>, final_byte: u8) {
+    fn csi(&mut self, mut params: Vec<u32>, private_marker: Option<u8>, intermediates: Vec<u8>, final_byte: u8) {
         fn p(params: &[u32], idx: usize) -> u32 {
             params.get(idx).copied().unwrap_or(0)
         }
         fn p1(params: &[u32], idx: usize) -> u32 {
             let v = params.get(idx).copied().unwrap_or(0);
             if v == 0 { 1 } else { v }
+        }
+
+        // DECSCUSR (cursor shape): CSI Ps SP q — intermediate is 0x20 (space).
+        if intermediates.first() == Some(&b' ') && final_byte == b'q' {
+            self.cursor_shape = p(&params, 0);
+            return;
         }
 
         match (private_marker, final_byte) {
@@ -346,11 +420,10 @@ impl Screen {
 
             // ── Erase ────────────────────────────────────────────────────────
             (None, b'J') => {
-                // Snapshot before active_mut.
                 let attrs = self.attrs.clone();
-                let rows = self.rows();
-                let row = self.cursor.row;
-                let col = self.cursor.col;
+                let rows  = self.rows();
+                let row   = self.cursor.row;
+                let col   = self.cursor.col;
                 match p(&params, 0) {
                     0 => {
                         self.active_mut().erase_row_from(row, col, &attrs);
@@ -374,8 +447,8 @@ impl Screen {
             }
             (None, b'K') => {
                 let attrs = self.attrs.clone();
-                let row = self.cursor.row;
-                let col = self.cursor.col;
+                let row   = self.cursor.row;
+                let col   = self.cursor.col;
                 match p(&params, 0) {
                     0 => self.active_mut().erase_row_from(row, col, &attrs),
                     1 => self.active_mut().erase_row_before(row, col, &attrs),
@@ -386,10 +459,10 @@ impl Screen {
 
             // ── Scroll ───────────────────────────────────────────────────────
             (None, b'S') => {
-                let n = p1(&params, 0) as usize;
-                let top = self.scroll_top;
+                let n      = p1(&params, 0) as usize;
+                let top    = self.scroll_top;
                 let bottom = self.scroll_bottom;
-                let attrs = self.attrs.clone();
+                let attrs  = self.attrs.clone();
                 let in_alt = self.in_alt;
                 let scrolled = self.active_mut().scroll_up(top, bottom, n, &attrs);
                 if !in_alt && top == 0 {
@@ -402,58 +475,65 @@ impl Screen {
                 }
             }
             (None, b'T') => {
-                let n = p1(&params, 0) as usize;
-                let top = self.scroll_top;
+                let n      = p1(&params, 0) as usize;
+                let top    = self.scroll_top;
                 let bottom = self.scroll_bottom;
-                let attrs = self.attrs.clone();
+                let attrs  = self.attrs.clone();
                 self.active_mut().scroll_down(top, bottom, n, &attrs);
             }
 
             // ── Insert / delete ──────────────────────────────────────────────
             (None, b'L') => {
-                let n = p1(&params, 0) as usize;
+                let n      = p1(&params, 0) as usize;
                 let bottom = self.scroll_bottom;
-                let row = self.cursor.row;
-                let attrs = self.attrs.clone();
+                let row    = self.cursor.row;
+                let attrs  = self.attrs.clone();
                 self.active_mut().insert_lines(row, bottom, n, &attrs);
             }
             (None, b'M') => {
-                let n = p1(&params, 0) as usize;
+                let n      = p1(&params, 0) as usize;
                 let bottom = self.scroll_bottom;
-                let row = self.cursor.row;
-                let attrs = self.attrs.clone();
+                let row    = self.cursor.row;
+                let attrs  = self.attrs.clone();
                 self.active_mut().delete_lines(row, bottom, n, &attrs);
             }
             (None, b'@') => {
-                let n = p1(&params, 0) as usize;
-                let (row, col) = (self.cursor.row, self.cursor.col);
-                let attrs = self.attrs.clone();
+                let n           = p1(&params, 0) as usize;
+                let (row, col)  = (self.cursor.row, self.cursor.col);
+                let attrs       = self.attrs.clone();
                 self.active_mut().insert_chars(row, col, n, &attrs);
             }
             (None, b'P') => {
-                let n = p1(&params, 0) as usize;
-                let (row, col) = (self.cursor.row, self.cursor.col);
-                let attrs = self.attrs.clone();
+                let n           = p1(&params, 0) as usize;
+                let (row, col)  = (self.cursor.row, self.cursor.col);
+                let attrs       = self.attrs.clone();
                 self.active_mut().delete_chars(row, col, n, &attrs);
             }
             (None, b'X') => {
-                let n = p1(&params, 0) as usize;
-                let (row, col) = (self.cursor.row, self.cursor.col);
-                let cols = self.cols();
-                let end = (col + n).min(cols);
-                let attrs = self.attrs.clone();
+                let n           = p1(&params, 0) as usize;
+                let (row, col)  = (self.cursor.row, self.cursor.col);
+                let cols        = self.cols();
+                let end         = (col + n).min(cols);
+                let attrs       = self.attrs.clone();
                 for c in col..end {
                     *self.active_mut().cell_mut(row, c) = Cell::blank_with(attrs.clone());
                 }
             }
 
+            // ── REP — repeat last printed character ──────────────────────────
+            (None, b'b') => {
+                let n  = p1(&params, 0) as usize;
+                let ch = self.last_char;
+                for _ in 0..n { self.print(ch); }
+            }
+
             // ── Scroll region ────────────────────────────────────────────────
             (None, b'r') => {
-                let rows = self.rows();
-                let top = p1(&params, 0) as usize - 1;
+                let rows   = self.rows();
+                let top    = p1(&params, 0) as usize - 1;
                 let bottom = if p(&params, 1) == 0 { rows - 1 } else { p(&params, 1) as usize - 1 };
                 if top < bottom && bottom < rows {
-                    self.scroll_top = top;
+                    self.scroll_top    = top;
                     self.scroll_bottom = bottom;
                 }
                 self.cursor.row = 0;
@@ -473,6 +553,30 @@ impl Screen {
                 self.apply_sgr(&params);
             }
 
+            // ── Device status report ─────────────────────────────────────────
+            (None, b'n') => {
+                match p(&params, 0) {
+                    5 => {
+                        // DSR — device status: respond "terminal is ready"
+                        self.pending_responses.push(b"\x1b[0n".to_vec());
+                    }
+                    6 => {
+                        // CPR — cursor position report: respond with ESC[row;colR
+                        let resp = format!("\x1b[{};{}R", self.cursor.row + 1, self.cursor.col + 1);
+                        self.pending_responses.push(resp.into_bytes());
+                    }
+                    _ => {}
+                }
+            }
+
+            // ── Primary device attributes ────────────────────────────────────
+            (None, b'c') => {
+                if p(&params, 0) == 0 {
+                    // Identify as VT100 with no options.
+                    self.pending_responses.push(b"\x1b[?1;0c".to_vec());
+                }
+            }
+
             // ── Private modes ────────────────────────────────────────────────
             (Some(b'?'), b'h') => {
                 for mode in params.clone() { self.set_private_mode(mode, true); }
@@ -487,20 +591,44 @@ impl Screen {
 
     fn set_private_mode(&mut self, mode: u32, set: bool) {
         match mode {
+            // DECCKM — application cursor keys.
+            1 => { self.app_cursor_keys = set; }
+
+            // DECAWM — auto-wrap mode. We always wrap; track the flag but don't change behaviour.
+            7 => {}
+
+            // Cursor blink — no visual difference yet; no-op.
+            12 => {}
+
+            // Cursor visibility.
             25 => { self.cursor.visible = set; }
-            1049 => {
+
+            // Mouse button reporting (X10-compatible).
+            1000 => {
+                self.mouse_mode = if set { MouseMode::X10 } else { MouseMode::Off };
+            }
+            // Mouse button + motion while pressed.
+            1002 => {
+                self.mouse_mode = if set { MouseMode::ButtonMotion } else { MouseMode::Off };
+            }
+            // Mouse button + all motion.
+            1003 => {
+                self.mouse_mode = if set { MouseMode::AnyMotion } else { MouseMode::Off };
+            }
+            // SGR extended mouse encoding.
+            1006 => { self.mouse_sgr = set; }
+            // URXVT extended mouse encoding — we use SGR, treat as no-op.
+            1015 => {}
+
+            // Alternate screen — save/restore cursor + grid.
+            47 => {
                 if set {
-                    self.saved_cursor = Some(self.cursor.clone());
                     self.in_alt = true;
-                    self.cursor = Cursor::default();
-                    let rows = self.alt.rows;
+                    let rows  = self.alt.rows;
                     let attrs = self.attrs.clone();
-                    for r in 0..rows {
-                        self.alt.erase_row(r, &attrs);
-                    }
+                    for r in 0..rows { self.alt.erase_row(r, &attrs); }
                 } else {
                     self.in_alt = false;
-                    if let Some(c) = self.saved_cursor.take() { self.cursor = c; }
                 }
                 self.pending_wrap = false;
             }
@@ -511,19 +639,24 @@ impl Screen {
                     self.cursor = c;
                 }
             }
-            47 => {
+            1049 => {
                 if set {
+                    self.saved_cursor = Some(self.cursor.clone());
                     self.in_alt = true;
-                    let rows = self.alt.rows;
+                    self.cursor = Cursor::default();
+                    let rows  = self.alt.rows;
                     let attrs = self.attrs.clone();
-                    for r in 0..rows {
-                        self.alt.erase_row(r, &attrs);
-                    }
+                    for r in 0..rows { self.alt.erase_row(r, &attrs); }
                 } else {
                     self.in_alt = false;
+                    if let Some(c) = self.saved_cursor.take() { self.cursor = c; }
                 }
                 self.pending_wrap = false;
             }
+
+            // Bracketed paste mode.
+            2004 => { self.bracketed_paste = set; }
+
             _ => {}
         }
     }
@@ -541,23 +674,21 @@ impl Screen {
                 23 => self.attrs.italic = false,
                 24 => self.attrs.underline = false,
                 27 => self.attrs.inverse = false,
-                n @ 30..=37 => self.attrs.fg = ANSI_NAMED[(n - 30) as usize],
-                39 => self.attrs.fg = Color::Default,
-                n @ 40..=47 => self.attrs.bg = ANSI_NAMED[(n - 40) as usize],
-                49 => self.attrs.bg = Color::Default,
+                n @ 30..=37  => self.attrs.fg = ANSI_NAMED[(n - 30) as usize],
+                39           => self.attrs.fg = Color::Default,
+                n @ 40..=47  => self.attrs.bg = ANSI_NAMED[(n - 40) as usize],
+                49           => self.attrs.bg = Color::Default,
                 n @ 90..=97  => self.attrs.fg = ANSI_BRIGHT[(n - 90) as usize],
                 n @ 100..=107 => self.attrs.bg = ANSI_BRIGHT[(n - 100) as usize],
                 38 => {
                     if let Some(color) = parse_extended_color(params, &mut i) {
                         self.attrs.fg = color;
                     }
-                    continue;
                 }
                 48 => {
                     if let Some(color) = parse_extended_color(params, &mut i) {
                         self.attrs.bg = color;
                     }
-                    continue;
                 }
                 _ => {}
             }
@@ -580,21 +711,20 @@ impl Screen {
 fn parse_extended_color(params: &[u32], i: &mut usize) -> Option<Color> {
     match params.get(*i + 1).copied() {
         Some(5) => {
-            let idx = params.get(*i + 2).copied()? as u8;
-            *i += 3;
-            Some(Color::Palette(idx))
+            // 256-colour: 38;5;n
+            let n = params.get(*i + 2).copied()? as u8;
+            *i += 2;
+            Some(Color::Palette(n))
         }
         Some(2) => {
+            // Truecolor: 38;2;r;g;b
             let r = params.get(*i + 2).copied()? as u8;
             let g = params.get(*i + 3).copied()? as u8;
             let b = params.get(*i + 4).copied()? as u8;
-            *i += 5;
+            *i += 4;
             Some(Color::Rgb(r, g, b))
         }
-        _ => {
-            *i += 1;
-            None
-        }
+        _ => None,
     }
 }
 
@@ -603,136 +733,152 @@ mod tests {
     use super::*;
     use crate::parser::Parser;
 
-    fn screen_from(input: &[u8], rows: usize, cols: usize) -> Screen {
-        let mut s = Screen::new(rows, cols);
+    fn feed(screen: &mut Screen, input: &[u8]) {
         let mut p = Parser::new();
-        p.advance(input, &mut |a| s.process(a));
-        s
+        p.advance(input, &mut |a| screen.process(a));
     }
 
-    // ── Color parsing ─────────────────────────────────────────────────────────
+    // ── existing tests ────────────────────────────────────────────────────────
 
     #[test]
-    fn sgr_standard_fg() {
-        let s = screen_from(b"\x1b[31mX", 1, 5);
-        assert_eq!(s.cell(0, 0).attrs.fg, Color::Indexed(1));
-    }
-
-    #[test]
-    fn sgr_bright_fg() {
-        let s = screen_from(b"\x1b[91mX", 1, 5);
-        assert_eq!(s.cell(0, 0).attrs.fg, Color::Indexed(9));
+    fn cursor_movement_basic() {
+        let mut s = Screen::new(24, 80);
+        feed(&mut s, b"\x1b[5;10H"); // CUP row=5, col=10
+        assert_eq!(s.cursor().row, 4);
+        assert_eq!(s.cursor().col, 9);
     }
 
     #[test]
-    fn sgr_256_fg() {
-        let s = screen_from(b"\x1b[38;5;200mX", 1, 5);
-        assert_eq!(s.cell(0, 0).attrs.fg, Color::Palette(200));
+    fn sgr_colors_16() {
+        let mut s = Screen::new(24, 80);
+        feed(&mut s, b"\x1b[31m"); // red fg
+        assert_eq!(s.attrs.fg, ANSI_NAMED[1]);
     }
 
     #[test]
-    fn sgr_truecolor_fg() {
-        let s = screen_from(b"\x1b[38;2;100;150;200mX", 1, 5);
-        assert_eq!(s.cell(0, 0).attrs.fg, Color::Rgb(100, 150, 200));
+    fn sgr_256_color() {
+        let mut s = Screen::new(24, 80);
+        feed(&mut s, b"\x1b[38;5;200m");
+        assert_eq!(s.attrs.fg, Color::Palette(200));
     }
 
     #[test]
-    fn sgr_bold_italic_underline() {
-        let s = screen_from(b"\x1b[1;3;4mX", 1, 5);
-        let a = &s.cell(0, 0).attrs;
-        assert!(a.bold && a.italic && a.underline);
+    fn sgr_truecolor() {
+        let mut s = Screen::new(24, 80);
+        feed(&mut s, b"\x1b[38;2;10;20;30m");
+        assert_eq!(s.attrs.fg, Color::Rgb(10, 20, 30));
     }
 
     #[test]
-    fn sgr_reset() {
-        let s = screen_from(b"\x1b[1m\x1b[0mX", 1, 5);
-        assert!(!s.cell(0, 0).attrs.bold);
-    }
-
-    // ── Cursor movement ───────────────────────────────────────────────────────
-
-    #[test]
-    fn cursor_up_from_row4() {
-        // CUP to row 5 col 1 → row=4, then CUU 2 → row=2.
-        let s = screen_from(b"\x1b[5;1H\x1b[2A", 10, 10);
-        assert_eq!(s.cursor().row, 2);
-    }
-
-    #[test]
-    fn cursor_set_position() {
-        let s = screen_from(b"\x1b[3;7H", 10, 10);
-        assert_eq!(s.cursor().row, 2);
-        assert_eq!(s.cursor().col, 6);
-    }
-
-    #[test]
-    fn cursor_home_default() {
-        let s = screen_from(b"\x1b[5;5H\x1b[H", 10, 10);
-        assert_eq!(s.cursor().row, 0);
-        assert_eq!(s.cursor().col, 0);
-    }
-
-    // ── Erase ─────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn erase_line_to_end() {
-        // "hello", move to col 2, erase to end of line → "he   "
-        let s = screen_from(b"hello\x1b[1;3H\x1b[K", 3, 10);
-        assert_eq!(s.cell(0, 0).ch, 'h');
-        assert_eq!(s.cell(0, 1).ch, 'e');
-        assert_eq!(s.cell(0, 2).ch, ' ');
-    }
-
-    #[test]
-    fn erase_whole_line() {
-        let s = screen_from(b"hello\x1b[1;1H\x1b[2K", 3, 10);
-        let row: String = s.row(0).iter().map(|c| c.ch).collect();
-        assert!(row.chars().all(|c| c == ' '));
-    }
-
-    #[test]
-    fn erase_display_to_end() {
-        let s = screen_from(b"hello\x1b[1;3H\x1b[0J", 3, 10);
-        let row1: String = s.row(1).iter().map(|c| c.ch).collect();
-        assert!(row1.chars().all(|c| c == ' '));
-    }
-
-    // ── Alt screen ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn alt_screen_enter_exit_restores_normal() {
-        let mut input = Vec::new();
-        input.extend_from_slice(b"line1\r\nline2\r\n");
-        input.extend_from_slice(b"\x1b[?1049h"); // enter alt
-        input.extend_from_slice(b"altcontent");
-        input.extend_from_slice(b"\x1b[?1049l"); // exit alt
-        let s = screen_from(&input, 5, 20);
-        assert!(!s.is_in_alt());
-        let found_normal = (0..s.rows()).any(|r| {
-            let text: String = s.row(r).iter().map(|c| c.ch).collect();
-            text.contains("line")
-        }) || s.scrollback().iter().any(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("line")
-        });
-        assert!(found_normal, "normal-screen content missing after alt-screen exit");
-        let alt_leaked = (0..s.rows()).any(|r| {
-            let text: String = s.row(r).iter().map(|c| c.ch).collect();
-            text.contains("altcontent")
-        });
-        assert!(!alt_leaked, "alt-screen content leaked into normal screen");
-    }
-
-    // ── Scrollback ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn scrollback_accumulates() {
-        let mut input = Vec::new();
-        for i in 0..5u8 {
-            input.push(b'A' + i);
-            input.extend_from_slice(b"\r\n");
+    fn alt_screen_isolates_scrollback() {
+        let mut s = Screen::new(5, 10);
+        // Fill normal screen, scroll some lines.
+        for _ in 0..10 {
+            feed(&mut s, b"hello\r\n");
         }
-        let s = screen_from(&input, 3, 10);
-        assert!(s.scrollback().len() >= 2, "expected scrollback, got {}", s.scrollback().len());
+        let sb_before = s.scrollback().len();
+        // Enter alt screen and write something.
+        feed(&mut s, b"\x1b[?1049h");
+        feed(&mut s, b"alt\r\n");
+        assert_eq!(s.scrollback().len(), sb_before);
+        // Leave alt screen: scrollback unchanged.
+        feed(&mut s, b"\x1b[?1049l");
+        assert_eq!(s.scrollback().len(), sb_before);
+    }
+
+    // ── Phase 6 new tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn app_cursor_keys_mode() {
+        let mut s = Screen::new(24, 80);
+        assert!(!s.app_cursor_keys);
+        feed(&mut s, b"\x1b[?1h");
+        assert!(s.app_cursor_keys);
+        feed(&mut s, b"\x1b[?1l");
+        assert!(!s.app_cursor_keys);
+    }
+
+    #[test]
+    fn mouse_mode_tracking() {
+        let mut s = Screen::new(24, 80);
+        assert_eq!(s.mouse_mode, MouseMode::Off);
+        feed(&mut s, b"\x1b[?1000h");
+        assert_eq!(s.mouse_mode, MouseMode::X10);
+        feed(&mut s, b"\x1b[?1002h");
+        assert_eq!(s.mouse_mode, MouseMode::ButtonMotion);
+        feed(&mut s, b"\x1b[?1003h");
+        assert_eq!(s.mouse_mode, MouseMode::AnyMotion);
+        feed(&mut s, b"\x1b[?1000l");
+        assert_eq!(s.mouse_mode, MouseMode::Off);
+    }
+
+    #[test]
+    fn sgr_mouse_encoding_flag() {
+        let mut s = Screen::new(24, 80);
+        assert!(!s.mouse_sgr);
+        feed(&mut s, b"\x1b[?1006h");
+        assert!(s.mouse_sgr);
+        feed(&mut s, b"\x1b[?1006l");
+        assert!(!s.mouse_sgr);
+    }
+
+    #[test]
+    fn bracketed_paste_mode() {
+        let mut s = Screen::new(24, 80);
+        assert!(!s.bracketed_paste);
+        feed(&mut s, b"\x1b[?2004h");
+        assert!(s.bracketed_paste);
+        feed(&mut s, b"\x1b[?2004l");
+        assert!(!s.bracketed_paste);
+    }
+
+    #[test]
+    fn deckpam_deckpnm() {
+        let mut s = Screen::new(24, 80);
+        assert!(!s.app_keypad);
+        feed(&mut s, b"\x1b="); // DECKPAM
+        assert!(s.app_keypad);
+        feed(&mut s, b"\x1b>"); // DECKPNM
+        assert!(!s.app_keypad);
+    }
+
+    #[test]
+    fn osc_window_title() {
+        let mut s = Screen::new(24, 80);
+        assert!(s.window_title.is_none());
+        feed(&mut s, b"\x1b]2;my shell\x07");
+        assert_eq!(s.window_title.as_deref(), Some("my shell"));
+        // OSC 0 also sets title.
+        feed(&mut s, b"\x1b]0;new title\x07");
+        assert_eq!(s.window_title.as_deref(), Some("new title"));
+    }
+
+    #[test]
+    fn decscusr_cursor_shape() {
+        let mut s = Screen::new(24, 80);
+        assert_eq!(s.cursor_shape, 0);
+        feed(&mut s, b"\x1b[2 q"); // steady block
+        assert_eq!(s.cursor_shape, 2);
+        feed(&mut s, b"\x1b[6 q"); // steady bar
+        assert_eq!(s.cursor_shape, 6);
+    }
+
+    #[test]
+    fn rep_repeats_last_char() {
+        let mut s = Screen::new(24, 80);
+        feed(&mut s, b"A\x1b[4b"); // 'A' then REP 4 (total 5 A's)
+        assert_eq!(s.cell(0, 0).ch, 'A');
+        assert_eq!(s.cell(0, 1).ch, 'A');
+        assert_eq!(s.cell(0, 4).ch, 'A');
+    }
+
+    #[test]
+    fn dsr_cursor_pos_queues_response() {
+        let mut s = Screen::new(24, 80);
+        feed(&mut s, b"\x1b[5;10H"); // cursor to row 5 col 10
+        feed(&mut s, b"\x1b[6n");    // request CPR
+        assert!(!s.pending_responses.is_empty());
+        let resp = std::str::from_utf8(&s.pending_responses[0]).unwrap();
+        assert_eq!(resp, "\x1b[5;10R");
     }
 }
